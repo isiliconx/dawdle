@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings are errors, so a lint regression cannot land quietly.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is in the matrix because ps.rs has a real second implementation
+        # behind it, and an untested platform branch is not a tested platform.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The git-blame tests need a real repository with real commits.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  # Unit tests run against a fake process table. This job runs the real binary
+  # against a real process tree, introduces a real regression in a real commit,
+  # and asserts that dawdle finds both. If the sampler, the step keys, the trend
+  # analysis or the git attribution breaks, this fails even though every unit
+  # test is green.
+  regression:
+    name: end-to-end regression detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+
+      - name: Record six healthy builds
+        run: |
+          for _ in 1 2 3 4 5 6; do
+            ./target/release/dawdle run -q --label ci -- sh tests/fixtures/burn.sh
+          done
+
+      - name: Commit a change that makes the same command slower
+        run: |
+          git config user.email "ci@example.invalid"
+          git config user.name  "dawdle ci"
+          echo 3000000 > tests/fixtures/burn.count
+          git add tests/fixtures/burn.count
+          git commit -q -m "make the burn fixture six times heavier"
+
+      - name: Record six regressed builds
+        run: |
+          for _ in 1 2 3 4 5 6; do
+            ./target/release/dawdle run -q --label ci -- sh tests/fixtures/burn.sh
+          done
+
+      - name: The report must name the step that regressed
+        run: |
+          ./target/release/dawdle report --label ci | tee report.txt
+          grep -q 'REGRESSIONS' report.txt
+          grep -q 'python3'   report.txt
+
+      - name: Blame must attribute it to the commit that caused it
+        run: |
+          ./target/release/dawdle blame python3 --label ci | tee blame.txt
+          grep -q 'six times heavier' blame.txt
+
+      - name: The markdown and json views must agree with the terminal one
+        run: |
+          ./target/release/dawdle report --label ci --markdown | grep -q 'python3'
+          ./target/release/dawdle report --label ci --json | grep -q 'python3'

@@ -243,16 +243,14 @@ impl Default for MacProcSource {
 
 impl ProcSource for MacProcSource {
     fn snapshot(&mut self) -> HashMap<i32, ProcInfo> {
-        // One `-o` per field, deliberately. Apple's ps(1) warns that a
-        // comma-separated list of `keyword=` headers "may be one column named
-        // X,comm=Y or two columns" and says to use multiple -o options when in
-        // doubt. With a single combined `-o`, BSD/macOS ps can emit the whole
-        // spec as one literal column, every line then fails to parse, and rss
-        // silently becomes 0. Separate options make each field its own column.
+        // A single combined -o, which is the form verified to work on macOS:
+        // with it the pid parses and only rss was wrong. Splitting it into one
+        // -o per field, which Apple's ps(1) suggests in one corner of its
+        // discussion, made ps emit no parseable row at all here, so the process
+        // vanished from the snapshot entirely. Column order is
+        // pid, ppid, time, rss, command, and `parse_ps_line` depends on it.
         let Ok(output) = Command::new("ps")
-            .args([
-                "-axo", "-o", "pid=", "-o", "ppid=", "-o", "rss=", "-o", "time=", "-o", "command=",
-            ])
+            .args(["-axo", "pid=,ppid=,time=,rss=,command="])
             .output()
         else {
             return HashMap::new();
@@ -266,13 +264,13 @@ impl ProcSource for MacProcSource {
     }
 }
 
-/// Parse one line of `ps -axo -o pid= -o ppid= -o rss= -o time= -o command=`
-/// output into a [`ProcInfo`], or `None` if the line is not a process row.
+/// Parse one line of `ps -axo pid=,ppid=,time=,rss=,command=` output into a
+/// pid and [`ProcInfo`], or `None` if the line is not a process row.
 ///
 /// Split out from [`MacProcSource::snapshot`] so it can be tested against
-/// captured output on any platform. The macOS reader originally got this wrong
-/// in a way only a real macOS could reveal; a synthetic line can hold every
-/// host to the same contract.
+/// captured output on any platform. Two real bugs lived here and neither was
+/// visible from Linux, where the /proc reader is a separate code path. A
+/// synthetic line can hold every host to the same contract.
 pub fn parse_ps_line(line: &str) -> Option<(i32, ProcInfo)> {
     // `split_whitespace`, not `splitn(.., char::is_whitespace)`. ps right-aligns
     // its numeric columns, so consecutive spaces between fields are normal, and
@@ -280,10 +278,10 @@ pub fn parse_ps_line(line: &str) -> Option<(i32, ProcInfo)> {
     // of those runs. Every line then failed to parse and rss came back 0 for
     // every process on macOS.
     let fields: Vec<&str> = line.split_whitespace().collect();
-    // pid, ppid, rss, time, then the command as whatever is left, joined back
+    // pid, ppid, time, rss, then the command as whatever is left, joined back
     // together because it legitimately contains spaces.
     let (leading, rest) = fields.split_at(4.min(fields.len()));
-    let [pid, ppid, rss, time, ..] = leading else {
+    let [pid, ppid, time, rss, ..] = leading else {
         return None;
     };
     let pid: i32 = pid.parse().ok()?;
@@ -399,7 +397,7 @@ mod tests {
         // on a real BSD-flavoured ps: right-aligned numeric columns, and a
         // command that contains spaces.
         let (pid, info) =
-            parse_ps_line("  47395  47394   12345 0:00.05 python3 -m pytest -x tests/")
+            parse_ps_line("  47395  47394 0:00.05   12345 python3 -m pytest -x tests/")
                 .expect("a well-formed line parses");
         assert_eq!(pid, 47395);
         assert_eq!(info.ppid, 47394);
@@ -412,21 +410,38 @@ mod tests {
     }
 
     #[test]
-    fn a_ps_line_does_not_confuse_rss_with_the_time_column() {
-        // The macOS reader parsed the column order as pid, ppid, time, rss, so
-        // rss picked up the time field and became 0 for every process. A test
-        // with the columns the way ps actually prints them holds every host to
-        // the same contract, not just macOS.
-        let (_, info) = parse_ps_line("  100  1  999 0:00.00 sh build.sh").expect("parses");
-        assert_eq!(info.rss_kb, 999, "the time field must not land in rss");
+    fn a_ps_line_survives_the_column_padding_ps_prints() {
+        // This is the actual macOS bug. `ps` right-aligns its columns, so the
+        // gaps between them are runs of spaces that vary in width from row to
+        // row. Splitting on individual whitespace characters produced an *empty*
+        // field for each of those runs, so every line failed to parse and rss
+        // came back 0 for every process on macOS.
+        //
+        // Synthetic rows rather than captured output, on purpose: real `ps`
+        // output from a working machine carries host paths and command-line
+        // secrets, and none of that belongs in a public repository.
+        let (_, info) = parse_ps_line("  100  1 0:00.00   999 sh build.sh").expect("parses");
+        assert_eq!(info.rss_kb, 999, "rss survives the padding");
         assert_eq!(info.cpu_ms, 0);
+
+        let rows = [
+            "      1       0 00:00:02    68 /sbin/init",
+            "  99999  88888 1:02.03 213664 /usr/bin/node server.js --port 8080",
+            "   2048       1 00:00:00   932 /bin/bash",
+        ];
+        for row in rows {
+            let (pid, info) =
+                parse_ps_line(row).unwrap_or_else(|| panic!("did not parse: {row:?}"));
+            assert!(pid > 0, "pid from {row:?}");
+            assert!(info.rss_kb > 0, "rss lost its column in {row:?}");
+        }
     }
 
     #[test]
     fn a_ps_line_without_a_command_still_parses() {
         // A kernel thread can have an empty command; dropping the whole row
         // would lose a real process from the tree.
-        let (_, info) = parse_ps_line("  7  2  512 1:02.03").expect("parses without a command");
+        let (_, info) = parse_ps_line("  7  2 1:02.03   512 ").expect("parses without a command");
         assert_eq!(info.ppid, 2);
         assert_eq!(info.rss_kb, 512);
         assert_eq!(info.cpu_ms, 62_030);
@@ -444,7 +459,7 @@ mod tests {
 
     #[test]
     fn a_ps_line_keeps_multibyte_commands_intact() {
-        let (_, info) = parse_ps_line("  5  1  64 0:00.01 ./build --name café").expect("parses");
+        let (_, info) = parse_ps_line("  5  1 0:00.01   64 ./build --name café").expect("parses");
         assert_eq!(info.cmdline, "./build --name café");
     }
 

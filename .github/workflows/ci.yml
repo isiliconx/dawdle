@@ -69,14 +69,14 @@ jobs:
         run: |
           ./target/release/dawdle report --label ci | tee report.txt
           grep -q 'REGRESSIONS' report.txt
-          grep -q 'python3'   report.txt
+          grep -q 'burn.sh'    report.txt
 
       - name: Blame must attribute it to the commit that caused it
         run: |
-          ./target/release/dawdle blame python3 --label ci | tee blame.txt
+          ./target/release/dawdle blame burn.sh --label ci | tee blame.txt
           grep -q 'six times heavier' blame.txt
 
       - name: The markdown and json views must agree with the terminal one
         run: |
-          ./target/release/dawdle report --label ci --markdown | grep -q 'python3'
-          ./target/release/dawdle report --label ci --json | grep -q 'python3'
+          ./target/release/dawdle report --label ci --markdown | grep -q 'burn.sh'
+          ./target/release/dawdle report --label ci --json | grep -q 'burn.sh'

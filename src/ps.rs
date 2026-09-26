@@ -243,41 +243,60 @@ impl Default for MacProcSource {
 
 impl ProcSource for MacProcSource {
     fn snapshot(&mut self) -> HashMap<i32, ProcInfo> {
+        // One `-o` per field, deliberately. Apple's ps(1) warns that a
+        // comma-separated list of `keyword=` headers "may be one column named
+        // X,comm=Y or two columns" and says to use multiple -o options when in
+        // doubt. With a single combined `-o`, BSD/macOS ps can emit the whole
+        // spec as one literal column, every line then fails to parse, and rss
+        // silently becomes 0. Separate options make each field its own column.
         let Ok(output) = Command::new("ps")
-            .args(["-axo", "pid=,ppid=,time=,rss=,command="])
+            .args([
+                "-axo", "-o", "pid=", "-o", "ppid=", "-o", "rss=", "-o", "time=", "-o", "command=",
+            ])
             .output()
         else {
             return HashMap::new();
         };
         let text = String::from_utf8_lossy(&output.stdout).to_string();
-        let mut out = HashMap::new();
-        for line in text.lines() {
-            let mut fields = line.trim().splitn(5, char::is_whitespace);
-            let (Some(pid), Some(ppid), Some(time), Some(rss)) = (
-                fields.next().and_then(|v| v.parse().ok()),
-                fields.next().and_then(|v| v.parse().ok()),
-                fields.next(),
-                fields.next(),
-            ) else {
-                continue;
-            };
-            let cmdline = fields.next().unwrap_or("").to_string();
-            out.insert(
-                pid,
-                ProcInfo {
-                    ppid,
-                    cpu_ms: parse_ps_time_ms(time),
-                    rss_kb: rss.parse().unwrap_or(0),
-                    cmdline,
-                },
-            );
-        }
-        out
+        text.lines().filter_map(parse_ps_line).collect()
     }
 
     fn describe(&self) -> String {
         "macos ps".to_string()
     }
+}
+
+/// Parse one line of `ps -axo -o pid= -o ppid= -o rss= -o time= -o command=`
+/// output into a [`ProcInfo`], or `None` if the line is not a process row.
+///
+/// Split out from [`MacProcSource::snapshot`] so it can be tested against
+/// captured output on any platform. The macOS reader originally got this wrong
+/// in a way only a real macOS could reveal; a synthetic line can hold every
+/// host to the same contract.
+pub fn parse_ps_line(line: &str) -> Option<(i32, ProcInfo)> {
+    // `split_whitespace`, not `splitn(.., char::is_whitespace)`. ps right-aligns
+    // its numeric columns, so consecutive spaces between fields are normal, and
+    // splitting on individual whitespace chars yields an *empty* field for each
+    // of those runs. Every line then failed to parse and rss came back 0 for
+    // every process on macOS.
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    // pid, ppid, rss, time, then the command as whatever is left, joined back
+    // together because it legitimately contains spaces.
+    let (leading, rest) = fields.split_at(4.min(fields.len()));
+    let [pid, ppid, rss, time, ..] = leading else {
+        return None;
+    };
+    let pid: i32 = pid.parse().ok()?;
+    let ppid = ppid.parse().ok()?;
+    Some((
+        pid,
+        ProcInfo {
+            ppid,
+            cpu_ms: parse_ps_time_ms(time),
+            rss_kb: rss.parse().unwrap_or(0),
+            cmdline: rest.join(" "),
+        },
+    ))
 }
 
 /// Parse the `[[dd-]hh:]mm:ss` elapsed-time format that BSD `ps` emits.
@@ -291,15 +310,39 @@ pub fn parse_ps_time_ms(text: &str) -> i64 {
     // The clock part accumulates in its own variable. Folding the days into the
     // same accumulator looks harmless and is not: the loop multiplies by 60 on
     // every component, so "2-00:00:00" would come back as 2 days times 3600.
+    // BSD `ps -o time=` prints fractional seconds ("0:00.05", "1:02.03"), so
+    // the final component is not a plain integer. Parsing it with `parse::<i64>`
+    // failed, and because the failure was swallowed into 0 the *whole seconds
+    // value* was lost: "1:02.03" came back as 60 seconds, not 62. Split the
+    // fraction off before converting.
+    let (whole, fraction) = match rest.rsplit_once('.') {
+        Some((whole, frac)) => (whole, frac),
+        None => (rest, ""),
+    };
     let mut seconds: i64 = 0;
-    for part in rest.split(':') {
+    for part in whole.split(':') {
         seconds = seconds
             .saturating_mul(60)
             .saturating_add(part.parse().unwrap_or(0));
     }
-    days.saturating_mul(86_400)
+    let total = days
+        .saturating_mul(86_400)
         .saturating_add(seconds)
-        .saturating_mul(1000)
+        .saturating_mul(1000);
+    // Hundredths at most, so two digits is plenty; anything longer is clamped
+    // rather than allowed to overflow the millisecond scale.
+    let millis: i64 = fraction
+        .chars()
+        .take(3)
+        .collect::<String>()
+        .parse::<i64>()
+        .unwrap_or(0);
+    let millis = if fraction.len() >= 3 {
+        millis
+    } else {
+        millis * 10i64.saturating_pow(3 - fraction.len() as u32)
+    };
+    total.saturating_add(millis.min(999))
 }
 
 /// Build the right source for the running platform.
@@ -348,6 +391,82 @@ mod tests {
         assert_eq!(parse_ps_time_ms("01:30"), 90_000);
         assert_eq!(parse_ps_time_ms("2-00:00:00"), 172_800_000);
         assert_eq!(parse_ps_time_ms("0:02"), 2_000);
+    }
+
+    #[test]
+    fn a_ps_line_parses_pid_ppid_rss_time_and_a_multiword_command() {
+        // Captured shape of `ps -axo -o pid= -o ppid= -o rss= -o time= -o command=`
+        // on a real BSD-flavoured ps: right-aligned numeric columns, and a
+        // command that contains spaces.
+        let (pid, info) =
+            parse_ps_line("  47395  47394   12345 0:00.05 python3 -m pytest -x tests/")
+                .expect("a well-formed line parses");
+        assert_eq!(pid, 47395);
+        assert_eq!(info.ppid, 47394);
+        assert_eq!(
+            info.rss_kb, 12345,
+            "rss is the third column, not the fourth"
+        );
+        assert_eq!(info.cpu_ms, 50);
+        assert_eq!(info.cmdline, "python3 -m pytest -x tests/");
+    }
+
+    #[test]
+    fn a_ps_line_does_not_confuse_rss_with_the_time_column() {
+        // The macOS reader parsed the column order as pid, ppid, time, rss, so
+        // rss picked up the time field and became 0 for every process. A test
+        // with the columns the way ps actually prints them holds every host to
+        // the same contract, not just macOS.
+        let (_, info) = parse_ps_line("  100  1  999 0:00.00 sh build.sh").expect("parses");
+        assert_eq!(info.rss_kb, 999, "the time field must not land in rss");
+        assert_eq!(info.cpu_ms, 0);
+    }
+
+    #[test]
+    fn a_ps_line_without_a_command_still_parses() {
+        // A kernel thread can have an empty command; dropping the whole row
+        // would lose a real process from the tree.
+        let (_, info) = parse_ps_line("  7  2  512 1:02.03").expect("parses without a command");
+        assert_eq!(info.ppid, 2);
+        assert_eq!(info.rss_kb, 512);
+        assert_eq!(info.cpu_ms, 62_030);
+        assert_eq!(info.cmdline, "");
+    }
+
+    #[test]
+    fn a_ps_header_or_garbage_line_is_rejected_rather_than_half_parsed() {
+        assert!(parse_ps_line("  PID  PPID  RSS TIME COMMAND").is_none());
+        assert!(parse_ps_line("").is_none());
+        // What BSD ps emits when a comma-separated -o spec is treated as one
+        // literal column, which is exactly how the bug presented.
+        assert!(parse_ps_line("pid=,ppid=,rss=,time=,command=").is_none());
+    }
+
+    #[test]
+    fn a_ps_line_keeps_multibyte_commands_intact() {
+        let (_, info) = parse_ps_line("  5  1  64 0:00.01 ./build --name café").expect("parses");
+        assert_eq!(info.cmdline, "./build --name café");
+    }
+
+    #[test]
+    fn a_ps_line_keeps_the_fractional_seconds_bsd_ps_prints() {
+        // BSD `ps -o time=` renders hundredths ("0:00.05"). Reading that as a
+        // plain integer failed and the failure was swallowed to 0, taking the
+        // whole seconds value with it: "1:02.03" came back as 60 seconds.
+        assert_eq!(parse_ps_time_ms("0:00.05"), 50);
+        assert_eq!(parse_ps_time_ms("1:02.03"), 62_030);
+        assert_eq!(parse_ps_time_ms("0:00.5"), 500, "one digit is tenths");
+        assert_eq!(parse_ps_time_ms("0:00.123"), 123, "millis are kept too");
+        assert_eq!(
+            parse_ps_time_ms("00:00:05"),
+            5_000,
+            "no fraction still works"
+        );
+        assert_eq!(
+            parse_ps_time_ms("1-00:00:00.50"),
+            86_400_500,
+            "one day plus 0.5s: the day prefix and the hundredths both count"
+        );
     }
 
     #[test]

@@ -1,0 +1,7 @@
+/target
+
+# Profile databases. dawdle also adds this to .git/info/exclude when it runs, so
+# it stays out of git without this file having to exist — but a checked-in
+# .gitignore is the convention, and a repo that was cloned rather than built in
+# place will not have run dawdle yet.
+/.dawdle

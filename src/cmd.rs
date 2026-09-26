@@ -25,21 +25,29 @@ use crate::sampler::Sampler;
 /// how far the build got.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-extern "C" {
-    fn signal(signum: i32, handler: usize) -> usize;
-}
-
-extern "C" fn on_signal(_signum: i32) {
+extern "C" fn on_signal(_signum: libc::c_int) {
     // Async-signal-safe: one relaxed store, nothing else.
     INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
+#[cfg(not(unix))]
 fn install_signal_handlers() {
-    const SIGINT: i32 = 2;
-    const SIGTERM: i32 = 15;
+    // No portable equivalent, and dawdle only claims Linux and macOS. The
+    // interrupted flag is simply never set, so a build is not shut down early.
+}
+
+#[cfg(unix)]
+fn install_signal_handlers() {
+    // The handler goes through a pointer because that is what the C signature
+    // takes; casting a function item straight to an integer is not the same
+    // thing and newer clippy is right to object.
+    let handler = on_signal as *const () as libc::sighandler_t;
+    // SAFETY: `on_signal` is `extern "C"`, takes one int, and only does a
+    // relaxed atomic store, so it is async-signal-safe. The returned previous
+    // handler is deliberately discarded.
     unsafe {
-        signal(SIGINT, on_signal as usize);
-        signal(SIGTERM, on_signal as usize);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
     }
 }
 
@@ -364,7 +372,7 @@ fn print_run_summary(
         };
         detail.push_str(&format!(
             " · {branch}{}{dirty}",
-            &git_facts.sha.chars().take(7).collect::<String>()
+            git_facts.sha.chars().take(7).collect::<String>()
         ));
     }
     println!("{}", fmt::dim(&detail));

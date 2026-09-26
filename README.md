@@ -129,8 +129,10 @@ invocation, and the two columns are the only way to tell them apart.
   at least twice — so you can tell when a build is made mostly of steps too short
   to catch. Catching every process needs eBPF or ptrace, which is a different tool
   with different privileges.
-- **macOS numbers are approximate.** `ps` reports wall-clock elapsed, not CPU.
-  Linux reads real CPU counters from `/proc`.
+- **The macOS reader is more expensive.** Linux reads `/proc` directly. macOS has no
+  equivalent, so every poll shells out to `ps` and parses its output, which costs
+  real time on every sample. `ps` does report CPU time (`time=`), but only to
+  hundredths of a second, so very short processes are quantised.
 - **CPU is read at the kernel's tick rate** (USER_HZ, 100 on nearly every Linux
   system, asked from `sysconf` rather than assumed). A process shorter than one
   tick can still be undercounted.
